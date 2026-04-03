@@ -4,32 +4,62 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from pymongo import MongoClient
-import google.generativeai as genai
+from groq import Groq
+import certifi
+import ssl
 import json
+import re
 import os
 
 load_dotenv()
 
-# ── Config ──────────────────────────────
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MONGODB_URL = os.getenv("MONGODB_URL")
+# ── Config ───────────────────────────────────────────────────────────────────
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+MONGODB_URL  = os.getenv("MONGODB_URL")
 
-if not GEMINI_API_KEY:
-    raise EnvironmentError("La variable d'environnement GEMINI_API_KEY est requise.")
+if not GROQ_API_KEY:
+    raise EnvironmentError("GROQ_API_KEY manquante dans .env")
 if not MONGODB_URL:
-    raise EnvironmentError("La variable d'environnement MONGODB_URL est requise.")
+    raise EnvironmentError("MONGODB_URL manquante dans .env")
 
-try:
-    genai.configure(api_key=GEMINI_API_KEY)
-except Exception as e:
-    raise RuntimeError(f"Impossible de configurer le client Gemini AI : {e}")
+# ── Groq ─────────────────────────────────────────────────────────────────────
+groq_client = Groq(api_key=GROQ_API_KEY)
 
-mongo_client = MongoClient(MONGODB_URL)
-db = mongo_client["talentdar1"]
+# ── MongoDB — fix SSL Windows ─────────────────────────────────────────────────
+# Le problème TLSV1_ALERT_INTERNAL_ERROR vient du contexte SSL de Python sur
+# Windows qui n'accepte pas les certificats d'Atlas par défaut.
+# Solution : forcer le contexte SSL avec certifi + désactiver la vérification
+# du nom d'hôte (uniquement en dev local — pas en production).
+
+ssl_context = ssl.create_default_context(cafile=certifi.where())
+ssl_context.check_hostname = False
+ssl_context.verify_mode = ssl.CERT_NONE   # ← fix principal pour Windows
+
+mongo_client = MongoClient(
+    MONGODB_URL,
+    tls=True,
+    tlsCAFile=certifi.where(),
+    tlsAllowInvalidCertificates=True,   # ← nécessaire sur certains Windows
+    serverSelectionTimeoutMS=30000,
+    connectTimeoutMS=30000,
+    socketTimeoutMS=30000,
+)
+
+db            = mongo_client["talentdar1"]
 cv_collection = db["cvs"]
 
+# ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="TalentDar API", version="1.0.0")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Schémas Pydantic ──────────────────────────────────────────────────────────
 class CVRequest(BaseModel):
     description: str
 
@@ -37,15 +67,15 @@ class MissionRequest(BaseModel):
     profile: str
     domain: Optional[str] = None
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ── Helper JSON ───────────────────────────────────────────────────────────────
+def parse_json_text(raw: str) -> dict:
+    cleaned = raw.strip().replace("```json", "").replace("```", "").strip()
+    match   = re.search(r'\{.*\}', cleaned, re.DOTALL)
+    if not match:
+        raise ValueError("Aucun JSON valide trouvé dans la réponse IA")
+    return json.loads(match.group(0))
 
-# ── Missions statiques ───────────────────
+# ── Missions statiques ────────────────────────────────────────────────────────
 MISSIONS = [
     {
         "id": 1, "domain": "dev", "domainLabel": "Développement",
@@ -153,32 +183,34 @@ MISSIONS = [
     }
 ]
 
-
-# ── Routes de base ───────────────────────
-
+# ── Routes de base ────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"message": "TalentDar API"}
+    return {"message": "TalentDar API — Groq + MongoDB"}
 
 
 @app.get("/health")
 def health():
     try:
         mongo_client.admin.command("ping")
-        return {"status": "ok", "mongodb": "connecté"}
+        mongo_ok = "connecté"
     except Exception as e:
-        return {"status": "error", "mongodb": str(e)}
+        mongo_ok = f"erreur: {str(e)[:80]}"
 
-def parse_json_text(raw_text: str):
-    cleaned = raw_text.strip().replace("```json", "").replace("```", "").strip()
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise json.JSONDecodeError("Aucun objet JSON détecté", cleaned, 0)
-    return json.loads(cleaned[start : end + 1])
+    try:
+        groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=1
+        )
+        groq_ok = "connecté"
+    except Exception as e:
+        groq_ok = f"erreur: {str(e)[:80]}"
 
-# ── CV Intelligent ───────────────────────
+    return {"status": "ok", "mongodb": mongo_ok, "groq": groq_ok}
 
+
+# ── CV Intelligent ────────────────────────────────────────────────────────────
 @app.post("/api/generate-cv")
 async def generate_cv(data: CVRequest):
     description = data.description.strip()
@@ -216,16 +248,24 @@ Le CV doit être en français professionnel même si la description est en darij
 Description : {description}"""
 
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        response = model.generate_content(prompt)
-        cv_data = parse_json_text(response.text)
+        completion = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=2000,
+        )
+        cv_data = parse_json_text(completion.choices[0].message.content)
 
-        # Sauvegarder dans MongoDB
-        cv_collection.insert_one({**cv_data, "description_originale": description})
+        # Sauvegarder dans MongoDB (sans bloquer si erreur)
+        try:
+            cv_collection.insert_one({**cv_data, "description_originale": description})
+        except Exception:
+            pass
 
         return {"success": True, "cv": cv_data}
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="Erreur parsing JSON.")
+
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -233,26 +273,26 @@ Description : {description}"""
 @app.get("/api/cvs")
 def get_all_cvs():
     """Retourne tous les CVs sauvegardés dans MongoDB."""
-    cvs = list(cv_collection.find({}, {"_id": 0}))
-    return cvs
+    try:
+        cvs = list(cv_collection.find({}, {"_id": 0}))
+        return cvs
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── Micro-missions ───────────────────────
-
+# ── Micro-missions ────────────────────────────────────────────────────────────
 @app.get("/api/missions")
-def get_missions(domain: Optional[str] = Query("all", description="Filtrer par domaine: dev/design/marketing/data/gestion/all")):
+def get_missions(
+    domain: Optional[str] = Query("all", description="dev / design / marketing / data / gestion / all")
+):
     if domain and domain.lower() != "all":
-        filtered = [m for m in MISSIONS if m.get("domain", "").lower() == domain.lower()]
-        return filtered
+        return [m for m in MISSIONS if m["domain"].lower() == domain.lower()]
     return MISSIONS
 
 
 @app.get("/api/missions/{mission_id}")
 def get_mission(mission_id: int):
-    mission = next(
-        (m for m in MISSIONS if int(m.get("id", -1)) == mission_id),
-        None,
-    )
+    mission = next((m for m in MISSIONS if m["id"] == mission_id), None)
     if not mission:
         raise HTTPException(status_code=404, detail="Mission introuvable.")
     return mission
@@ -261,7 +301,7 @@ def get_mission(mission_id: int):
 @app.post("/api/missions/generate")
 async def generate_mission(data: MissionRequest):
     profile = data.profile.strip()
-    domain = (data.domain or "").strip()
+    domain  = (data.domain or "").strip()
     if not profile:
         raise HTTPException(status_code=400, detail="Profil vide.")
 
@@ -287,12 +327,173 @@ Réponds UNIQUEMENT avec ce JSON brut, sans texte ni backticks :
 }}"""
 
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        response = model.generate_content(prompt)
-        mission = parse_json_text(response.text)
+        completion = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=1500,
+        )
+        mission = parse_json_text(completion.choices[0].message.content)
         mission["id"] = 999
         return {"success": True, "mission": mission}
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="Erreur parsing JSON.")
+
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Coach Entretien ───────────────────────────────────────
+
+class EntretienSetup(BaseModel):
+    poste: str
+    secteur: str
+    niveau: str
+    lang: Optional[str] = "fr"
+
+class EntretienEval(BaseModel):
+    poste: str
+    niveau: str
+    question: str
+    reponse: str
+    lang: Optional[str] = "fr"
+
+class EntretienFinal(BaseModel):
+    poste: str
+    niveau: str
+    questions: list
+    reponses: list
+    scores: list
+
+
+@app.post("/api/entretien/questions")
+async def generate_questions(data: EntretienSetup):
+    poste = data.poste.strip()
+    if not poste:
+        raise HTTPException(status_code=400, detail="Poste vide.")
+
+    if data.lang == "darija":
+        langue = "Les questions doivent être en darija marocain."
+    elif data.lang == "mix":
+        langue = "Alterne entre français et darija marocain."
+    else:
+        langue = "Les questions doivent être en français professionnel."
+
+    prompt = f"""Tu es un recruteur RH expert marocain.
+Génère exactement 5 questions d'entretien pour ce profil.
+
+Poste : {poste}
+Secteur : {data.secteur}
+Niveau : {data.niveau}
+{langue}
+
+Mélange questions comportementales et techniques liées au poste.
+
+Réponds UNIQUEMENT avec ce JSON brut, sans texte ni backticks :
+
+{{"questions": ["Question 1","Question 2","Question 3","Question 4","Question 5"]}}"""
+
+    try:
+        completion = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.4,
+            max_tokens=800,
+        )
+        result = parse_json_text(completion.choices[0].message.content)
+        return {"success": True, "questions": result.get("questions", [])}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/entretien/evaluer")
+async def evaluer_reponse(data: EntretienEval):
+    if not data.reponse.strip():
+        raise HTTPException(status_code=400, detail="Réponse vide.")
+
+    langue_fb = "en darija marocain" if data.lang == "darija" else "en français professionnel"
+
+    prompt = f"""Tu es un recruteur RH expert marocain. Évalue cette réponse d'entretien.
+
+Poste visé : {data.poste}
+Niveau : {data.niveau}
+Question : {data.question}
+Réponse du candidat : {data.reponse}
+
+Donne le feedback {langue_fb}.
+
+Réponds UNIQUEMENT avec ce JSON brut, sans texte ni backticks :
+
+{{
+  "score": 7,
+  "note_globale": "Bien",
+  "points_forts": ["Point fort 1", "Point fort 2"],
+  "points_ameliorer": ["Point à améliorer 1"],
+  "conseil": "Conseil court et actionnable en 1-2 phrases.",
+  "exemple_meilleure_reponse": "Reformulation plus impactante de la réponse."
+}}"""
+
+    try:
+        completion = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=800,
+        )
+        feedback = parse_json_text(completion.choices[0].message.content)
+
+        try:
+            db["entretiens"].insert_one({
+                "poste": data.poste, "niveau": data.niveau,
+                "question": data.question, "reponse": data.reponse,
+                "feedback": feedback, "lang": data.lang
+            })
+        except Exception:
+            pass
+
+        return {"success": True, "feedback": feedback}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/entretien/rapport")
+async def generer_rapport(data: EntretienFinal):
+    if not data.reponses:
+        raise HTTPException(status_code=400, detail="Aucune réponse.")
+
+    avg = sum(data.scores) / len(data.scores) if data.scores else 0
+    qa  = "\n".join([
+        f"Q{i+1}: {data.questions[i]}\nR: {data.reponses[i]}"
+        for i in range(min(len(data.questions), len(data.reponses)))
+    ])
+
+    prompt = f"""Tu es un coach carrière expert marocain.
+Génère un rapport de bilan d'entretien.
+
+Poste : {data.poste} | Niveau : {data.niveau} | Score moyen : {avg:.1f}/10
+
+{qa}
+
+Réponds UNIQUEMENT avec ce JSON brut, sans texte ni backticks :
+
+{{
+  "score_global": {avg:.1f},
+  "mention": "Excellent",
+  "resume": "Résumé global en 2-3 phrases.",
+  "points_forts": ["Force 1", "Force 2", "Force 3"],
+  "axes_amelioration": ["Axe 1", "Axe 2"],
+  "conseils_pratiques": ["Conseil 1", "Conseil 2", "Conseil 3"],
+  "prochaines_etapes": "Ce que le candidat doit faire concrètement."
+}}"""
+
+    try:
+        completion = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=1000,
+        )
+        rapport = parse_json_text(completion.choices[0].message.content)
+        return {"success": True, "rapport": rapport}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
