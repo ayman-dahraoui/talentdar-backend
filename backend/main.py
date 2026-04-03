@@ -17,7 +17,7 @@ app.add_middleware(
 
 @app.get("/")
 def root():
-    return {"message": "TalentDar API is running 🚀"}
+    return {"Hello World 🚀"}
 
 @app.get("/health")
 def health():
