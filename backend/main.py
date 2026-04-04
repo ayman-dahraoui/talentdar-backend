@@ -113,7 +113,9 @@ app.add_middleware(
 )
 
 
-
+# ─────────────────────────────────────────
+#  Données statiques des micro-missions
+# ─────────────────────────────────────────
 
 MISSIONS = [
     {
@@ -223,7 +225,9 @@ MISSIONS = [
 ]
 
 
-
+# ─────────────────────────────────────────
+#  Routes de base
+# ─────────────────────────────────────────
 
 @app.get("/")
 def root():
@@ -235,7 +239,9 @@ def health():
     return {"status": "ok"}
 
 
-
+# ─────────────────────────────────────────
+#  CV Intelligent
+# ─────────────────────────────────────────
 
 @app.post("/api/generate-cv")
 async def generate_cv(data: dict):
@@ -282,7 +288,9 @@ Description : {description}"""
         raise HTTPException(status_code=500, detail=str(e))
 
 
-
+# ─────────────────────────────────────────
+#  Micro-missions
+# ─────────────────────────────────────────
 
 @app.get("/api/missions")
 def get_missions(domain: str = None):
