@@ -217,35 +217,37 @@ async def generate_cv(data: CVRequest):
     if not description:
         raise HTTPException(status_code=400, detail="Description vide.")
 
-    prompt = f"""Tu es un expert RH et rédacteur de CV professionnel marocain.
-L'utilisateur décrit son parcours en darija, français ou anglais.
+    prompt = f"""Tu es un expert RH marocain.
 
-Réponds UNIQUEMENT avec ce JSON brut, sans texte ni backticks :
+IMPORTANT :
+- N'invente AUCUNE information
+- Utilise UNIQUEMENT les données fournies
+- Si des informations sont manquantes, retourne-les dans "missing_fields"
+
+Réponds UNIQUEMENT avec ce JSON brut :
 
 {{
-  "name": "Prénom Nom",
-  "title": "Titre professionnel visé",
-  "contact": {{
-    "email": "email@exemple.com",
-    "phone": "+212 6XX XXX XXX",
-    "location": "Ville, Maroc",
-    "linkedin": "linkedin.com/in/prenom-nom"
-  }},
-  "summary": "Résumé professionnel percutant de 2-3 phrases",
-  "experience": [
-    {{"role": "Titre du poste", "company": "Entreprise", "period": "2021 – 2024", "description": "Responsabilités et réalisations"}}
-  ],
-  "education": [
-    {{"degree": "Diplôme", "school": "École / Université", "period": "2017 – 2021"}}
-  ],
-  "skills": ["Compétence 1", "Compétence 2", "Compétence 3"],
-  "languages": ["Arabe (natif)", "Français (courant)", "Anglais (professionnel)"]
+  "complete": true,
+  "missing_fields": [],
+  "cv": {{
+    "name": "",
+    "title": "",
+    "contact": {{
+      "email": "",
+      "phone": "",
+      "location": "",
+      "linkedin": ""
+    }},
+    "summary": "",
+    "experience": [],
+    "education": [],
+    "skills": [],
+    "languages": []
+  }}
 }}
 
-Si des informations manquent, génère des données plausibles.
-Le CV doit être en français professionnel même si la description est en darija.
-
-Description : {description}"""
+Description : {description}
+"""
 
     try:
         completion = groq_client.chat.completions.create(
@@ -254,9 +256,19 @@ Description : {description}"""
             temperature=0.1,
             max_tokens=2000,
         )
-        cv_data = parse_json_text(completion.choices[0].message.content)
 
-        # Sauvegarder dans MongoDB (sans bloquer si erreur)
+        result = parse_json_text(completion.choices[0].message.content)
+
+        # 🔴 Si infos manquantes
+        if not result.get("complete"):
+            return {
+                "success": False,
+                "missing_fields": result.get("missing_fields", [])
+            }
+
+        cv_data = result.get("cv", {})
+
+        # Sauvegarde MongoDB
         try:
             cv_collection.insert_one({**cv_data, "description_originale": description})
         except Exception:
